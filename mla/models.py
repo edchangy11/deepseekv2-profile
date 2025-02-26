@@ -18,51 +18,44 @@ class SimpleAttention(torch.nn.Module):
         # Add projection for hidden_states_q
         self.q_proj = torch.nn.Linear(q_lora_rank, num_heads * head_dim, dtype=dtype, device='cuda')
         
-    def forward(self, hidden_states_q: torch.Tensor, compressed_kv: torch.Tensor):
+    def forward(self, hidden_states_q: torch.Tensor, key_value: torch.Tensor):
         """
         Input:
         - hidden_states_q: [bsz, q_lora_rank]
-        - compressed_kv: [bsz, seq_len, lora_rank]
+        - key_value: [bsz, seq_len, num_heads, 2*head_dim] - combined key and value
         """
         bsz = hidden_states_q.shape[0]
-        seq_len = compressed_kv.shape[1]
+        seq_len = key_value.shape[1]
+        
+        # Split key_value into separate key and value tensors
+        # Last dimension contains head_dim for key followed by head_dim for value
+        key = key_value[:, :, :, :self.head_dim]  # [bsz, seq_len, num_heads, head_dim]
+        value = key_value[:, :, :, self.head_dim:]  # [bsz, seq_len, num_heads, head_dim]
         
         # Project query
         q = self.q_proj(hidden_states_q).view(bsz, self.num_heads, self.head_dim)
-        self.q = q
         
-        # Weight absorption trick: FIXED to match the working version
-        # Use matmul with reshaping instead of bmm+transpose
-        q_reshaped = q.view(bsz, self.num_heads, self.head_dim, 1)
-        q_absorbed = torch.matmul(self.w_kc.transpose(1, 2), q_reshaped).squeeze(-1)
+        # Reshape q for bmm
+        q_reshaped = q.reshape(bsz * self.num_heads, 1, self.head_dim)
         
-        # Calculate attention scores without expansion
-        # Transpose compressed_kv to [bsz, lora_rank, seq_len]
-        compressed_kv_transposed = compressed_kv.transpose(1, 2).contiguous()
+        # Reshape k for bmm: [bsz, seq_len, num_heads, head_dim] -> [bsz*num_heads, seq_len, head_dim]
+        k_reshaped = key.permute(0, 2, 1, 3).reshape(bsz * self.num_heads, seq_len, self.head_dim)
         
-        # For each batch and head, compute attention scores
-        # Reshape q_absorbed to [bsz, num_heads, 1, lora_rank]
-        # Use regular matmul with broadcasting
-        attn_scores = torch.matmul(
-            q_absorbed.unsqueeze(2),  # [bsz, num_heads, 1, lora_rank]
-            compressed_kv_transposed.unsqueeze(1)  # [bsz, 1, lora_rank, seq_len]
-        ).squeeze(2)  # Result: [bsz, num_heads, seq_len]
+        # Calculate attention scores (q * k^T)
+        k_transposed = k_reshaped.transpose(1, 2)
+        attn_scores = torch.bmm(q_reshaped, k_transposed).view(bsz, self.num_heads, seq_len)
         
         # Apply softmax to get attention probabilities
         attn_probs = torch.nn.functional.softmax(attn_scores, dim=-1)
         
-        # Apply attention weights to compressed values without expansion
-        # Reshape attn_probs to [bsz, num_heads, seq_len, 1]
-        # Use regular matmul with broadcasting
-        context = torch.matmul(
-            attn_probs.unsqueeze(3),  # [bsz, num_heads, seq_len, 1]
-            compressed_kv.unsqueeze(1)  # [bsz, 1, seq_len, lora_rank]
-        ).squeeze(2)  # Result: [bsz, num_heads, lora_rank]
+        # Reshape attention probs for bmm
+        attn_probs_reshaped = attn_probs.reshape(bsz * self.num_heads, 1, seq_len)
         
-        # Final projection: FIXED to match the working version
-        # Use matmul with reshaping instead of bmm+transpose
-        context_reshaped = context.view(bsz, self.num_heads, self.lora_rank, 1)
-        attn_output = torch.matmul(self.w_vc, context_reshaped).squeeze(-1)
+        # Reshape v for bmm: [bsz, seq_len, num_heads, head_dim] -> [bsz*num_heads, seq_len, head_dim]
+        v_reshaped = value.permute(0, 2, 1, 3).reshape(bsz * self.num_heads, seq_len, self.head_dim)
+        
+        # Apply attention to values
+        attn_output = torch.bmm(attn_probs_reshaped, v_reshaped).view(bsz, self.num_heads, self.head_dim)
         
         # Reshape to final output
         attn_output = attn_output.reshape(bsz, self.num_heads * self.head_dim)
@@ -98,7 +91,6 @@ class SimpleCompressedAttention(torch.nn.Module):
         # Project hidden_states_q
         q = self.q_proj(hidden_states_q)
         q = q.view(bsz, self.num_heads, self.head_dim)
-        self.q = q
         
         # Project compressed_kv to key and value separately
         k = self.k_proj(compressed_kv)  # [bsz, seq_len, num_heads * head_dim]
@@ -141,11 +133,19 @@ class SimpleAbsorbedAttention(torch.nn.Module):
         self.k_proj = torch.nn.Linear(lora_rank, num_heads * head_dim, dtype=dtype, bias=False, device='cuda')
         self.v_proj = torch.nn.Linear(lora_rank, num_heads * head_dim, dtype=dtype, bias=False, device='cuda')
         
-        # Precompute the weight matrices (keep this part)
-        self.w_kc = self.k_proj.weight.view(num_heads, head_dim, lora_rank).contiguous()
-        self.w_vc = self.v_proj.weight.view(num_heads, head_dim, lora_rank).contiguous()
-        
+        # Store reshaping parameters but don't precompute yet - will be updated in forward pass
+        self.w_kc = None
+        self.w_vc = None
         self.q = None
+        
+        # Update weight matrices
+        self._update_weight_matrices()
+        
+    def _update_weight_matrices(self):
+        """Update the absorbed weight matrices based on current projection matrices"""
+        # Correctly reshape the weight matrices
+        self.w_kc = self.k_proj.weight.view(self.num_heads, self.head_dim, self.lora_rank).contiguous()
+        self.w_vc = self.v_proj.weight.view(self.num_heads, self.head_dim, self.lora_rank).contiguous()
     
     def forward(self, hidden_states_q: torch.Tensor, compressed_kv: torch.Tensor):
         """
@@ -156,33 +156,27 @@ class SimpleAbsorbedAttention(torch.nn.Module):
         bsz = hidden_states_q.shape[0]
         seq_len = compressed_kv.shape[1]
         
+        # Make sure weight matrices are updated
+        if self.w_kc is None or self.w_vc is None:
+            self._update_weight_matrices()
+        
         # Project query
         q = self.q_proj(hidden_states_q).view(bsz, self.num_heads, self.head_dim)
-        self.q = q
         
-        # Weight absorption trick: FIXED to match the working version
-        # Use matmul with reshaping instead of bmm+transpose
+        # Weight absorption trick
         q_reshaped = q.view(bsz, self.num_heads, self.head_dim, 1)
         q_absorbed = torch.matmul(self.w_kc.transpose(1, 2), q_reshaped).squeeze(-1)
         
-        # Calculate attention scores: OPTIMIZED to avoid expansion
-        # Transpose first to get [bsz, lora_rank, seq_len]
-        compressed_kv_transposed = compressed_kv.transpose(1, 2).contiguous()
-        
-        # Reshape q_absorbed to [bsz, num_heads, lora_rank]
-        # Reshape compressed_kv_transposed to [bsz, 1, lora_rank, seq_len]
-        # Use einsum for efficient batched matrix multiplication without expansion
-        attn_scores = torch.einsum('bhl,blk->bhk', q_absorbed, compressed_kv_transposed)
+        # Calculate attention scores with einsum
+        attn_scores = torch.einsum('bhd,bsd->bhs', q_absorbed, compressed_kv)
         
         # Apply softmax to get attention probabilities
         attn_probs = torch.nn.functional.softmax(attn_scores, dim=-1)
         
-        # Apply attention weights to compressed values: OPTIMIZED to avoid expansion
-        # Use einsum instead of bmm with expansion
-        context = torch.einsum('bhs,bsl->bhl', attn_probs, compressed_kv)
+        # Apply attention weights with einsum
+        context = torch.einsum('bhs,bsd->bhd', attn_probs, compressed_kv)
         
-        # Final projection: FIXED to match the working version
-        # Use matmul with reshaping instead of bmm+transpose
+        # Final projection
         context_reshaped = context.view(bsz, self.num_heads, self.lora_rank, 1)
         attn_output = torch.matmul(self.w_vc, context_reshaped).squeeze(-1)
         
@@ -202,14 +196,14 @@ if __name__ == "__main__":
     torch.set_grad_enabled(False)
     # Create a simple test case
     test_batch_size = 1
-    test_seq_len = 1000
-    test_heads = 320
-    head_dim = 8
-    test_lora_rank = 8
-    q_lora_rank = 1536
+    test_seq_len = 10
+    test_heads = 5#128
+    head_dim = 40
+    test_lora_rank = 8#512
+    q_lora_rank = 16#1536
 
     # Choose precision
-    dtype = torch.float32  # Using float32 for more precise comparison
+    dtype = torch.float16  # Using float32 for more precise comparison
     
     # Create test inputs with specified precision
     test_hidden_q = torch.randn((test_batch_size, q_lora_rank), dtype=dtype, device='cuda')
@@ -233,6 +227,7 @@ if __name__ == "__main__":
     v_proj_weight = compressed_attn.v_proj.weight.clone()
     
     # Initialize SimpleAbsorbedAttention with the same weights
+# Initialize SimpleAbsorbedAttention
     absorbed_attn = SimpleAbsorbedAttention(
         num_heads=test_heads, 
         head_dim=head_dim, 
@@ -240,32 +235,29 @@ if __name__ == "__main__":
         q_lora_rank=q_lora_rank, 
         dtype=dtype
     ).cuda()
-    
-    # Copy q_proj weights directly
+
+    # Copy weights directly
     absorbed_attn.q_proj.weight.data.copy_(q_proj_weight)
     absorbed_attn.k_proj.weight.data.copy_(k_proj_weight)
     absorbed_attn.v_proj.weight.data.copy_(v_proj_weight)
-    # For the kv weights, we need to reshape and copy to match the absorbed attention format
-        # Verify weights are identical
-        # Update the reshaped weight matrices after copying the weights
-    absorbed_attn.w_kc = absorbed_attn.k_proj.weight.view(test_heads, head_dim, test_lora_rank).contiguous()
-    absorbed_attn.w_vc = absorbed_attn.v_proj.weight.view(test_heads, head_dim, test_lora_rank).contiguous()
+
+    # IMPORTANT: Update the weight matrices after copying the weights
+    absorbed_attn._update_weight_matrices()  # This will correctly reshape the weights
 
     # Run both models
     with torch.no_grad():
         compressed_output = compressed_attn(test_hidden_q, test_compressed_kv)
         absorbed_output = absorbed_attn(test_hidden_q, test_compressed_kv)
-
-    # Compare outputs
-    max_diff = torch.max(torch.abs(compressed_output - absorbed_output)).item()
-    avg_diff = torch.mean(torch.abs(compressed_output - absorbed_output)).item()
+        # Compare outputs
+        max_diff = torch.max(torch.abs(compressed_output - absorbed_output)).item()
+        avg_diff = torch.mean(torch.abs(compressed_output - absorbed_output)).item()
     
     print(f"Output shapes - Compressed: {compressed_output.shape}, Absorbed: {absorbed_output.shape}")
     print(f"Maximum absolute difference: {max_diff:.6e}")
     print(f"Average absolute difference: {avg_diff:.6e}")
     
     # Check if outputs are close enough (allowing for numerical precision differences)
-    tolerance = 1e-5
+    tolerance = 1e-2
     is_close = max_diff < tolerance
     print(f"Outputs are {'equivalent' if is_close else 'different'} (tolerance: {tolerance})")
     

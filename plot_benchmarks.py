@@ -142,8 +142,8 @@ def plot_benchmarks(batch_size=1):
                     color='green')
 
     # Configure plot
-    # plt.xscale('log')
-    # plt.yscale('log')
+    plt.xscale('log')
+    plt.yscale('log')
     plt.xlabel('KV Cache Length', fontsize=12)
     plt.ylabel('Time (seconds)', fontsize=12)
     plt.title(f'Cache Performance Comparison batch size = {batch_size}', fontsize=14)
@@ -158,5 +158,5 @@ def plot_benchmarks(batch_size=1):
 
 if __name__ == "__main__":
     # You can specify different batch sizes here
-    plot_benchmarks(batch_size=256)
-    print(f"Plot saved as results/bsz-1/benchmark_comparison.png") 
+    plot_benchmarks(batch_size=4)
+    print(f"Plot saved  ") 

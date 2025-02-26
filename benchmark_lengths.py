@@ -12,7 +12,7 @@ if torch.cuda.is_available():
     print(f"Using GPU: {torch.cuda.current_device()}")
 
 
-seed = 50
+seed = 22
 np.random.seed(seed)
 torch.manual_seed(seed)
 if torch.cuda.is_available():
@@ -20,11 +20,11 @@ if torch.cuda.is_available():
 
 def run_benchmarks():
     # Sequence lengths to test (100, 316, 1000, 3162, 10000)
-    kv_lengths = [int(x) for x in np.logspace(2, 6, num=3)]
-    batch_size = 32
+    kv_lengths = [int(x) for x in np.logspace(2, 4.8, num=8)]
+    batch_size = 4
     
     # Models to benchmark
-    models = ['SimpleAttention', 'SimpleCompressedAttention'] #'OptimizedMLA']
+    models = [ 'SimpleAttention', 'SimpleCompressedAttention', 'SimpleAbsorbedAttention'] #'OptimizedMLA']
     # Create results directory if it doesn't exist
     base_results_dir = "results"
     results_dir = os.path.join(base_results_dir, f"bsz-{batch_size}")
